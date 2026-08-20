@@ -32,8 +32,8 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 # Free-tier daily request caps, as published by each provider.
 # Used to calculate "remaining" quota for the rate limit UI.
 PROVIDER_DAILY_CAPS = {
-    "groq": 14400,       # llama-3.3-70b-versatile free tier
-    "gemini": 1500,      # gemini-2.0-flash free tier
+    "groq": 14400,       # openai/gpt-oss-120b free tier
+    "gemini": 1500,      # gemini-3.6-flash free tier
     "openrouter": 200,   # conservative estimate for :free models
 }
 
@@ -113,7 +113,7 @@ class MessageCreate(BaseModel):
 
 class BoxCreateRequest(BaseModel):
     title: str = "Boxed chat"
-    pinned_message_ids: list[str]  # message IDs pulled from two (or more) source chats  # previous AI answer(s) on this doc, if any
+    source_conversation_ids: list[str]  # whole conversations to pull references from  # previous AI answer(s) on this doc, if any
 
 
 # ---------------------------------------------------------------
@@ -134,7 +134,7 @@ async def call_groq(history: list[dict], message: str) -> dict:
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {GROQ_KEY}",
             },
-            json={"model": "llama-3.3-70b-versatile", "messages": messages},
+            json={"model": "openai/gpt-oss-120b", "messages": messages},
         )
     if res.status_code != 200:
         raise Exception(f"Groq {res.status_code}: {res.text[:200]}")
@@ -161,7 +161,7 @@ async def call_gemini(history: list[dict], message: str) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         res = await client.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={GEMINI_KEY}",
+            f"gemini-3.6-flash:generateContent?key={GEMINI_KEY}",
             json={"contents": contents},
         )
     if res.status_code != 200:
@@ -191,7 +191,7 @@ async def call_openrouter(history: list[dict], message: str) -> dict:
                 "Authorization": f"Bearer {OPENROUTER_KEY}",
             },
             json={
-                "model": "meta-llama/llama-3.1-8b-instruct:free",
+                "model": "meta-llama/llama-3.1-8b-instruct",
                 "messages": messages,
             },
         )
@@ -558,34 +558,55 @@ async def toggle_pin_message(message_id: str):
 
 @app.post("/conversations/box")
 async def create_boxed_conversation(req: BoxCreateRequest):
-    """Creates a new conversation seeded with specific pinned messages
-    pulled from one or more existing chats. The AI gets these exact
-    messages as locked-in context, without replaying either full chat —
-    keeping the merge cheap while still giving real cross-chat awareness."""
+    """Creates a new conversation that combines reference points from
+    two or more existing chats. For each source conversation, we use
+    any messages the person explicitly pinned as 'key messages' — or,
+    if none were pinned, fall back to that conversation's most recent
+    exchange. This keeps the merge cheap: the AI gets specific locked-in
+    context instead of replaying either full chat."""
     if not supabase:
         raise HTTPException(status_code=503, detail="History storage not configured.")
-    if not req.pinned_message_ids:
-        raise HTTPException(status_code=400, detail="No reference messages provided.")
+    if not req.source_conversation_ids or len(req.source_conversation_ids) < 2:
+        raise HTTPException(status_code=400, detail="Select at least 2 conversations to box.")
 
     try:
-        # Fetch the actual pinned messages to seed the new box
-        res = (
-            supabase.table("messages")
-            .select("*")
-            .in_("id", req.pinned_message_ids)
-            .execute()
-        )
-        source_messages = res.data
+        source_messages = []
+
+        for conv_id in req.source_conversation_ids:
+            # First preference: messages explicitly pinned in this chat
+            pinned_res = (
+                supabase.table("messages")
+                .select("*")
+                .eq("conversation_id", conv_id)
+                .eq("is_pinned_ref", True)
+                .execute()
+            )
+
+            if pinned_res.data:
+                source_messages.extend(pinned_res.data)
+            else:
+                # Fallback: most recent message in this conversation,
+                # so boxing still works even if nothing was pinned.
+                recent_res = (
+                    supabase.table("messages")
+                    .select("*")
+                    .eq("conversation_id", conv_id)
+                    .order("created_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                source_messages.extend(recent_res.data)
+
         if not source_messages:
-            raise HTTPException(status_code=404, detail="None of the referenced messages were found.")
+            raise HTTPException(
+                status_code=404,
+                detail="None of the selected conversations have any messages to reference.",
+            )
 
         # Create the new boxed conversation
         conv_res = supabase.table("conversations").insert({"title": req.title}).execute()
         new_conv = conv_res.data[0]
 
-        # Seed it with a system-style opening message that locks in the
-        # references, formatted clearly so the AI treats them as
-        # established context rather than something to re-derive.
         context_lines = "\n\n".join(
             f"[Reference from a prior chat — {m['role']}]: {m['content']}"
             for m in source_messages
