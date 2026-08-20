@@ -10,6 +10,7 @@ import os
 import io
 import httpx
 import PyPDF2
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -27,6 +28,15 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+# Free-tier daily request caps, as published by each provider.
+# Used to calculate "remaining" quota for the rate limit UI.
+PROVIDER_DAILY_CAPS = {
+    "groq": 14400,       # llama-3.3-70b-versatile free tier
+    "gemini": 1500,      # gemini-2.0-flash free tier
+    "openrouter": 200,   # conservative estimate for :free models
+}
+
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -81,7 +91,29 @@ class ChatRequest(BaseModel):
 class AgentRequest(BaseModel):
     doc_text: str
     task: str
-    prior_context: str | None = None  # previous AI answer(s) on this doc, if any
+    prior_context: str | None = None
+
+
+class ConversationCreate(BaseModel):
+    title: str = "New chat"
+    is_incognito: bool = False
+
+
+class ConversationUpdate(BaseModel):
+    title: str | None = None
+    pinned: bool | None = None
+
+
+class MessageCreate(BaseModel):
+    conversation_id: str
+    role: str
+    content: str
+    is_pinned_ref: bool = False
+
+
+class BoxCreateRequest(BaseModel):
+    title: str = "Boxed chat"
+    pinned_message_ids: list[str]  # message IDs pulled from two (or more) source chats  # previous AI answer(s) on this doc, if any
 
 
 # ---------------------------------------------------------------
@@ -336,3 +368,243 @@ async def get_usage():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not fetch usage: {e}")
+
+
+@app.get("/rate-limits")
+async def get_rate_limits():
+    """Returns today's request count per provider vs their free-tier
+    daily cap, so the UI can show 'X of Y requests used today'."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Usage tracking not configured on server.")
+
+    try:
+        # "Today" boundary in UTC — simple and consistent regardless of
+        # where the request comes from.
+        start_of_day = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+
+        res = (
+            supabase.table("usage_logs")
+            .select("provider")
+            .gte("created_at", start_of_day)
+            .execute()
+        )
+        rows = res.data
+
+        counts_today = {}
+        for r in rows:
+            p = r["provider"]
+            counts_today[p] = counts_today.get(p, 0) + 1
+
+        result = {}
+        for provider, cap in PROVIDER_DAILY_CAPS.items():
+            used = counts_today.get(provider, 0)
+            result[provider] = {
+                "used": used,
+                "cap": cap,
+                "remaining": max(cap - used, 0),
+                "percent_used": round((used / cap) * 100, 1) if cap else 0,
+            }
+
+        return {"providers": result, "reset_note": "Resets daily at midnight UTC"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not fetch rate limits: {e}")
+
+
+# ---------------------------------------------------------------
+# Conversations — real chat history with pin/delete
+# ---------------------------------------------------------------
+@app.post("/conversations")
+async def create_conversation(req: ConversationCreate):
+    if req.is_incognito:
+        # Incognito conversations are never written to Supabase.
+        # The frontend keeps them entirely in memory.
+        raise HTTPException(
+            status_code=400,
+            detail="Incognito conversations should not be saved via this endpoint.",
+        )
+    if not supabase:
+        raise HTTPException(status_code=503, detail="History storage not configured.")
+
+    try:
+        res = supabase.table("conversations").insert({"title": req.title}).execute()
+        return res.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not create conversation: {e}")
+
+
+@app.get("/conversations")
+async def list_conversations():
+    if not supabase:
+        raise HTTPException(status_code=503, detail="History storage not configured.")
+
+    try:
+        res = (
+            supabase.table("conversations")
+            .select("*")
+            .order("pinned", desc=True)
+            .order("updated_at", desc=True)
+            .execute()
+        )
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not list conversations: {e}")
+
+
+@app.get("/conversations/{conversation_id}/messages")
+async def get_conversation_messages(conversation_id: str):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="History storage not configured.")
+
+    try:
+        res = (
+            supabase.table("messages")
+            .select("*")
+            .eq("conversation_id", conversation_id)
+            .order("created_at")
+            .execute()
+        )
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not fetch messages: {e}")
+
+
+@app.patch("/conversations/{conversation_id}")
+async def update_conversation(conversation_id: str, req: ConversationUpdate):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="History storage not configured.")
+
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+
+    try:
+        res = (
+            supabase.table("conversations")
+            .update(updates)
+            .eq("id", conversation_id)
+            .execute()
+        )
+        return res.data[0] if res.data else {"status": "updated"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not update conversation: {e}")
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="History storage not configured.")
+
+    try:
+        supabase.table("conversations").delete().eq("id", conversation_id).execute()
+        return {"status": "deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not delete conversation: {e}")
+
+
+@app.post("/messages")
+async def save_message(req: MessageCreate):
+    """Saves a single message to a conversation. Called by the frontend
+    after every user message and every completed AI response — but
+    NEVER called for incognito conversations."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="History storage not configured.")
+
+    try:
+        res = supabase.table("messages").insert({
+            "conversation_id": req.conversation_id,
+            "role": req.role,
+            "content": req.content,
+            "is_pinned_ref": req.is_pinned_ref,
+        }).execute()
+
+        # Bump the conversation's updated_at so it sorts to the top of history
+        supabase.table("conversations").update(
+            {"updated_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", req.conversation_id).execute()
+
+        return res.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not save message: {e}")
+
+
+@app.patch("/messages/{message_id}/pin")
+async def toggle_pin_message(message_id: str):
+    """Marks/unmarks a message as a 'key message' reference — used by
+    the box feature to pull precise context from a chat instead of
+    replaying the whole conversation."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="History storage not configured.")
+
+    try:
+        current = supabase.table("messages").select("is_pinned_ref").eq("id", message_id).execute()
+        if not current.data:
+            raise HTTPException(status_code=404, detail="Message not found.")
+
+        new_state = not current.data[0]["is_pinned_ref"]
+        res = (
+            supabase.table("messages")
+            .update({"is_pinned_ref": new_state})
+            .eq("id", message_id)
+            .execute()
+        )
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not toggle pin: {e}")
+
+
+@app.post("/conversations/box")
+async def create_boxed_conversation(req: BoxCreateRequest):
+    """Creates a new conversation seeded with specific pinned messages
+    pulled from one or more existing chats. The AI gets these exact
+    messages as locked-in context, without replaying either full chat —
+    keeping the merge cheap while still giving real cross-chat awareness."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="History storage not configured.")
+    if not req.pinned_message_ids:
+        raise HTTPException(status_code=400, detail="No reference messages provided.")
+
+    try:
+        # Fetch the actual pinned messages to seed the new box
+        res = (
+            supabase.table("messages")
+            .select("*")
+            .in_("id", req.pinned_message_ids)
+            .execute()
+        )
+        source_messages = res.data
+        if not source_messages:
+            raise HTTPException(status_code=404, detail="None of the referenced messages were found.")
+
+        # Create the new boxed conversation
+        conv_res = supabase.table("conversations").insert({"title": req.title}).execute()
+        new_conv = conv_res.data[0]
+
+        # Seed it with a system-style opening message that locks in the
+        # references, formatted clearly so the AI treats them as
+        # established context rather than something to re-derive.
+        context_lines = "\n\n".join(
+            f"[Reference from a prior chat — {m['role']}]: {m['content']}"
+            for m in source_messages
+        )
+        seed_content = (
+            "The following are key reference points carried over from "
+            "earlier conversations. Treat them as already-established "
+            "context:\n\n" + context_lines
+        )
+
+        supabase.table("messages").insert({
+            "conversation_id": new_conv["id"],
+            "role": "assistant",
+            "content": f"I've combined the key points you selected. Here's what I'm carrying forward:\n\n{context_lines}",
+            "is_pinned_ref": False,
+        }).execute()
+
+        return {"conversation": new_conv, "seed_context": seed_content}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not create boxed conversation: {e}")
