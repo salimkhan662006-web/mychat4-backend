@@ -10,8 +10,10 @@ import os
 import io
 import httpx
 import PyPDF2
+import jwt
+from jwt import PyJWKClient
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -28,6 +30,14 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+# Supabase now signs user session JWTs with a rotating asymmetric key
+# pair rather than one static shared secret. We verify tokens against
+# Supabase's public JWKS endpoint instead of storing a secret — this
+# means key rotation on Supabase's side never breaks our backend, and
+# there's no secret to leak in the first place.
+SUPABASE_JWKS_URL = f"{SUPABASE_URL}/auth/v1/jwks" if SUPABASE_URL else ""
+_jwks_client = PyJWKClient(SUPABASE_JWKS_URL) if SUPABASE_JWKS_URL else None
 
 # Free-tier daily request caps, as published by each provider.
 # Used to calculate "remaining" quota for the rate limit UI.
@@ -57,7 +67,7 @@ app.add_middleware(
 )
 
 
-def log_usage(endpoint: str, provider: str, prompt_tokens: int, completion_tokens: int, success: bool = True):
+def log_usage(endpoint: str, provider: str, prompt_tokens: int, completion_tokens: int, success: bool = True, user_id: str | None = None):
     """Fire-and-forget usage log to Supabase. Never blocks or breaks
     the main request if Supabase is unreachable or not configured."""
     if not supabase:
@@ -70,9 +80,61 @@ def log_usage(endpoint: str, provider: str, prompt_tokens: int, completion_token
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
             "success": success,
+            "user_id": user_id,
         }).execute()
     except Exception as e:
         print(f"Usage logging failed (non-fatal): {e}")
+
+
+# ---------------------------------------------------------------
+# Authentication — validates the Supabase-issued JWT on protected
+# routes and extracts the calling user's id.
+# ---------------------------------------------------------------
+async def get_current_user(authorization: str | None = Header(default=None)) -> str:
+    """FastAPI dependency: reads the 'Authorization: Bearer <token>'
+    header, verifies it was genuinely issued by Supabase for this
+    project (via Supabase's public JWKS endpoint), and returns the
+    user's id. Raises 401 if missing/invalid/expired."""
+    if not _jwks_client:
+        raise HTTPException(status_code=503, detail="Auth not configured on server.")
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header.")
+
+    token = authorization.removeprefix("Bearer ").strip()
+
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["ES256", "RS256"],
+            audience="authenticated",
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+    except jwt.PyJWKClientError as e:
+        raise HTTPException(status_code=401, detail=f"Could not verify token signature: {e}")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid session token: {e}")
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token missing user id.")
+
+    return user_id
+
+
+async def get_optional_user(authorization: str | None = Header(default=None)) -> str | None:
+    """Like get_current_user, but returns None instead of raising when
+    no token is present — for routes that work for both logged-in and
+    anonymous/incognito use (e.g. /chat, /agent don't require login)."""
+    if not authorization or not authorization.startswith("Bearer ") or not _jwks_client:
+        return None
+    try:
+        return await get_current_user(authorization)
+    except HTTPException:
+        return None
 
 
 # ---------------------------------------------------------------
@@ -207,7 +269,7 @@ async def call_openrouter(history: list[dict], message: str) -> dict:
     }
 
 
-async def get_ai_response(history: list[dict], message: str, endpoint: str = "chat") -> dict:
+async def get_ai_response(history: list[dict], message: str, endpoint: str = "chat", user_id: str | None = None) -> dict:
     """Tries Groq -> Gemini -> OpenRouter in order. Returns which one
     answered, and logs token usage to Supabase (non-blocking)."""
     errors = []
@@ -224,6 +286,7 @@ async def get_ai_response(history: list[dict], message: str, endpoint: str = "ch
                 provider=name,
                 prompt_tokens=result["prompt_tokens"],
                 completion_tokens=result["completion_tokens"],
+                user_id=user_id,
             )
             return {"reply": result["text"], "provider": name}
         except Exception as e:
@@ -244,9 +307,9 @@ async def health_check():
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, user_id: str | None = Depends(get_optional_user)):
     history = [m.model_dump() for m in req.history]
-    result = await get_ai_response(history, req.message, endpoint="chat")
+    result = await get_ai_response(history, req.message, endpoint="chat", user_id=user_id)
     return result
 
 
@@ -280,7 +343,7 @@ async def upload_doc(file: UploadFile = File(...)):
 
 
 @app.post("/agent")
-async def run_agent(req: AgentRequest):
+async def run_agent(req: AgentRequest, user_id: str | None = Depends(get_optional_user)):
     if not req.doc_text.strip():
         raise HTTPException(status_code=400, detail="No document text provided.")
     if not req.task.strip():
@@ -310,7 +373,7 @@ async def run_agent(req: AgentRequest):
             "information to complete the task, say so directly."
         )
 
-    result = await get_ai_response(history=[], message=prompt, endpoint="agent")
+    result = await get_ai_response(history=[], message=prompt, endpoint="agent", user_id=user_id)
 
     # Safety net: if the model said it needs the full doc, retry once with it.
     if result["reply"].strip() == "NEED_FULL_DOCUMENT":
@@ -321,7 +384,7 @@ async def run_agent(req: AgentRequest):
             "Complete this task thoroughly and clearly, using only information "
             "from the document above."
         )
-        result = await get_ai_response(history=[], message=fallback_prompt, endpoint="agent")
+        result = await get_ai_response(history=[], message=fallback_prompt, endpoint="agent", user_id=user_id)
 
     return {"result": result["reply"], "provider": result["provider"]}
 
@@ -416,7 +479,7 @@ async def get_rate_limits():
 # Conversations — real chat history with pin/delete
 # ---------------------------------------------------------------
 @app.post("/conversations")
-async def create_conversation(req: ConversationCreate):
+async def create_conversation(req: ConversationCreate, user_id: str = Depends(get_current_user)):
     if req.is_incognito:
         # Incognito conversations are never written to Supabase.
         # The frontend keeps them entirely in memory.
@@ -428,14 +491,17 @@ async def create_conversation(req: ConversationCreate):
         raise HTTPException(status_code=503, detail="History storage not configured.")
 
     try:
-        res = supabase.table("conversations").insert({"title": req.title}).execute()
+        res = supabase.table("conversations").insert({
+            "title": req.title,
+            "user_id": user_id,
+        }).execute()
         return res.data[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not create conversation: {e}")
 
 
 @app.get("/conversations")
-async def list_conversations():
+async def list_conversations(user_id: str = Depends(get_current_user)):
     if not supabase:
         raise HTTPException(status_code=503, detail="History storage not configured.")
 
@@ -443,6 +509,7 @@ async def list_conversations():
         res = (
             supabase.table("conversations")
             .select("*")
+            .eq("user_id", user_id)
             .order("pinned", desc=True)
             .order("updated_at", desc=True)
             .execute()
@@ -453,11 +520,22 @@ async def list_conversations():
 
 
 @app.get("/conversations/{conversation_id}/messages")
-async def get_conversation_messages(conversation_id: str):
+async def get_conversation_messages(conversation_id: str, user_id: str = Depends(get_current_user)):
     if not supabase:
         raise HTTPException(status_code=503, detail="History storage not configured.")
 
     try:
+        # Verify this conversation actually belongs to the requesting user
+        owner_check = (
+            supabase.table("conversations")
+            .select("id")
+            .eq("id", conversation_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        if not owner_check.data:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+
         res = (
             supabase.table("messages")
             .select("*")
@@ -466,12 +544,14 @@ async def get_conversation_messages(conversation_id: str):
             .execute()
         )
         return res.data
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not fetch messages: {e}")
 
 
 @app.patch("/conversations/{conversation_id}")
-async def update_conversation(conversation_id: str, req: ConversationUpdate):
+async def update_conversation(conversation_id: str, req: ConversationUpdate, user_id: str = Depends(get_current_user)):
     if not supabase:
         raise HTTPException(status_code=503, detail="History storage not configured.")
 
@@ -484,27 +564,38 @@ async def update_conversation(conversation_id: str, req: ConversationUpdate):
             supabase.table("conversations")
             .update(updates)
             .eq("id", conversation_id)
+            .eq("user_id", user_id)  # can't update someone else's chat
             .execute()
         )
-        return res.data[0] if res.data else {"status": "updated"}
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        return res.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not update conversation: {e}")
 
 
 @app.delete("/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str):
+async def delete_conversation(conversation_id: str, user_id: str = Depends(get_current_user)):
     if not supabase:
         raise HTTPException(status_code=503, detail="History storage not configured.")
 
     try:
-        supabase.table("conversations").delete().eq("id", conversation_id).execute()
+        res = (
+            supabase.table("conversations")
+            .delete()
+            .eq("id", conversation_id)
+            .eq("user_id", user_id)  # can't delete someone else's chat
+            .execute()
+        )
         return {"status": "deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not delete conversation: {e}")
 
 
 @app.post("/messages")
-async def save_message(req: MessageCreate):
+async def save_message(req: MessageCreate, user_id: str = Depends(get_current_user)):
     """Saves a single message to a conversation. Called by the frontend
     after every user message and every completed AI response — but
     NEVER called for incognito conversations."""
@@ -512,6 +603,17 @@ async def save_message(req: MessageCreate):
         raise HTTPException(status_code=503, detail="History storage not configured.")
 
     try:
+        # Verify the conversation belongs to this user before writing to it
+        owner_check = (
+            supabase.table("conversations")
+            .select("id")
+            .eq("id", req.conversation_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        if not owner_check.data:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+
         res = supabase.table("messages").insert({
             "conversation_id": req.conversation_id,
             "role": req.role,
@@ -525,12 +627,14 @@ async def save_message(req: MessageCreate):
         ).eq("id", req.conversation_id).execute()
 
         return res.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not save message: {e}")
 
 
 @app.patch("/messages/{message_id}/pin")
-async def toggle_pin_message(message_id: str):
+async def toggle_pin_message(message_id: str, user_id: str = Depends(get_current_user)):
     """Marks/unmarks a message as a 'key message' reference — used by
     the box feature to pull precise context from a chat instead of
     replaying the whole conversation."""
@@ -557,7 +661,7 @@ async def toggle_pin_message(message_id: str):
 
 
 @app.post("/conversations/box")
-async def create_boxed_conversation(req: BoxCreateRequest):
+async def create_boxed_conversation(req: BoxCreateRequest, user_id: str = Depends(get_current_user)):
     """Creates a new conversation that combines reference points from
     two or more existing chats. For each source conversation, we use
     any messages the person explicitly pinned as 'key messages' — or,
@@ -573,6 +677,18 @@ async def create_boxed_conversation(req: BoxCreateRequest):
         source_messages = []
 
         for conv_id in req.source_conversation_ids:
+            # Confirm this source conversation actually belongs to the
+            # requesting user before pulling anything from it.
+            owner_check = (
+                supabase.table("conversations")
+                .select("id")
+                .eq("id", conv_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            if not owner_check.data:
+                continue  # skip conversations that aren't theirs, silently
+
             # First preference: messages explicitly pinned in this chat
             pinned_res = (
                 supabase.table("messages")
@@ -603,8 +719,11 @@ async def create_boxed_conversation(req: BoxCreateRequest):
                 detail="None of the selected conversations have any messages to reference.",
             )
 
-        # Create the new boxed conversation
-        conv_res = supabase.table("conversations").insert({"title": req.title}).execute()
+        # Create the new boxed conversation, owned by this user
+        conv_res = supabase.table("conversations").insert({
+            "title": req.title,
+            "user_id": user_id,
+        }).execute()
         new_conv = conv_res.data[0]
 
         context_lines = "\n\n".join(
