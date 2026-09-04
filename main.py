@@ -9,6 +9,7 @@ so if one provider is rate-limited or down, the next one takes over.
 import os
 import io
 import time
+import secrets
 import httpx
 import PyPDF2
 import jwt
@@ -31,6 +32,53 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "")
+
+
+async def send_deletion_email(to_email: str, confirm_url: str):
+    """Sends the account-deletion confirmation email via Resend.
+    Raises on failure so the caller can decide how to handle it —
+    we don't want to silently pretend an email was sent when it wasn't."""
+    if not RESEND_API_KEY:
+        raise Exception("RESEND_API_KEY not configured on server.")
+
+    html_body = f"""
+    <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">
+      <h2 style="color:#8B1A1A;">Confirm account deletion</h2>
+      <p>We received a request to permanently delete your MyChat4 account
+      and all associated data — conversations, messages, and usage history.</p>
+      <p><strong>This cannot be undone.</strong> If you didn't request this,
+      you can safely ignore this email — nothing will happen.</p>
+      <p style="margin: 28px 0;">
+        <a href="{confirm_url}"
+           style="background:#FF2E2E; color:#fff; padding:12px 24px;
+                  border-radius:8px; text-decoration:none; font-weight:600;">
+          Permanently delete my account
+        </a>
+      </p>
+      <p style="color:#888; font-size:13px;">This link expires in 24 hours.</p>
+    </div>
+    """
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        res = await client.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": "Confirm deletion of your MyChat4 account",
+                "html": html_body,
+            },
+        )
+    if res.status_code >= 400:
+        raise Exception(f"Resend API error {res.status_code}: {res.text[:200]}")
 
 # Supabase now signs user session JWTs with a rotating asymmetric key
 # pair rather than one static shared secret. We verify tokens against
@@ -794,3 +842,152 @@ async def create_boxed_conversation(req: BoxCreateRequest, user_id: str = Depend
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not create boxed conversation: {e}")
+
+
+# ---------------------------------------------------------------
+# Account management — data summary, reset, and deletion
+# ---------------------------------------------------------------
+@app.get("/account/summary")
+async def account_summary(user_id: str = Depends(get_current_user)):
+    """Returns a plain-language summary of what data this account has,
+    for the Account settings screen — real transparency instead of a
+    vague privacy policy link."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Storage not configured.")
+
+    try:
+        convs = supabase.table("conversations").select("id").eq("user_id", user_id).execute()
+        conv_ids = [c["id"] for c in convs.data]
+
+        message_count = 0
+        if conv_ids:
+            msgs = supabase.table("messages").select("id", count="exact").in_("conversation_id", conv_ids).execute()
+            message_count = msgs.count or 0
+
+        usage = supabase.table("usage_logs").select("total_tokens").eq("user_id", user_id).execute()
+        total_tokens = sum(r["total_tokens"] for r in usage.data)
+
+        return {
+            "conversation_count": len(conv_ids),
+            "message_count": message_count,
+            "total_tokens_used": total_tokens,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not fetch account summary: {e}")
+
+
+@app.post("/account/reset-data")
+async def reset_account_data(user_id: str = Depends(get_current_user)):
+    """Wipes all conversations, messages, and usage history for this
+    account — but leaves the login/account itself fully intact."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Storage not configured.")
+
+    try:
+        # Deleting conversations cascades to their messages automatically
+        # (see the schema's "on delete cascade" for messages).
+        supabase.table("conversations").delete().eq("user_id", user_id).execute()
+        supabase.table("usage_logs").delete().eq("user_id", user_id).execute()
+        return {"status": "reset", "message": "All conversations and usage history have been wiped."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not reset account data: {e}")
+
+
+@app.post("/account/request-deletion")
+async def request_account_deletion(user_id: str = Depends(get_current_user)):
+    """Step 1 of account deletion: generates a one-time token and emails
+    a confirmation link containing it. Nothing is deleted yet — deletion
+    only happens when the link is clicked and verified via
+    /account/confirm-deletion."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Storage not configured.")
+
+    token = secrets.token_urlsafe(32)
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+
+    try:
+        # Look up the user's email so we know where to send the link
+        user_res = supabase.auth.admin.get_user_by_id(user_id)
+        user_email = user_res.user.email if user_res and user_res.user else None
+        if not user_email:
+            raise HTTPException(status_code=404, detail="Could not find account email.")
+
+        supabase.table("deletion_requests").insert({
+            "user_id": user_id,
+            "token": token,
+            "expires_at": expires_at,
+        }).execute()
+
+        confirm_url = f"{FRONTEND_URL}/confirm-delete?token={token}"
+
+        try:
+            await send_deletion_email(user_email, confirm_url)
+        except Exception as email_err:
+            # The token is valid either way, but be honest that the
+            # email itself may not have gone out.
+            return {
+                "status": "pending_confirmation",
+                "message": f"Deletion requested, but the confirmation email could not be sent ({email_err}). Contact support.",
+                "expires_at": expires_at,
+            }
+
+        return {
+            "status": "pending_confirmation",
+            "message": "A confirmation link has been sent to your email. Click it to complete deletion.",
+            "expires_at": expires_at,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not start account deletion: {e}")
+
+
+class ConfirmDeletionRequest(BaseModel):
+    token: str
+
+
+@app.post("/account/confirm-deletion")
+async def confirm_account_deletion(req: ConfirmDeletionRequest):
+    """Step 2: verifies the emailed token and, if valid and unexpired,
+    permanently deletes the account and ALL associated data. This
+    route does NOT require a Bearer token — the deletion token itself
+    is the proof of intent, since the person may be acting from a
+    fresh browser session via the email link."""
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Storage not configured.")
+
+    try:
+        res = (
+            supabase.table("deletion_requests")
+            .select("*")
+            .eq("token", req.token)
+            .eq("used", False)
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(status_code=400, detail="Invalid or already-used deletion link.")
+
+        request_row = res.data[0]
+        expires_at = datetime.fromisoformat(request_row["expires_at"])
+        if datetime.now(timezone.utc) > expires_at:
+            raise HTTPException(status_code=400, detail="This deletion link has expired. Please request a new one.")
+
+        user_id = request_row["user_id"]
+
+        # Delete all owned data first
+        supabase.table("conversations").delete().eq("user_id", user_id).execute()
+        supabase.table("usage_logs").delete().eq("user_id", user_id).execute()
+
+        # Mark the token used before deleting the account, in case
+        # anything below fails partway
+        supabase.table("deletion_requests").update({"used": True}).eq("id", request_row["id"]).execute()
+
+        # Finally, delete the actual auth account — requires admin API,
+        # available via the service_role-authenticated client.
+        supabase.auth.admin.delete_user(user_id)
+
+        return {"status": "deleted", "message": "Your account and all associated data have been permanently deleted."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not complete account deletion: {e}")
