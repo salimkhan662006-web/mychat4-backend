@@ -8,10 +8,11 @@ so if one provider is rate-limited or down, the next one takes over.
 
 import os
 import io
+import time
 import httpx
 import PyPDF2
 import jwt
-from jwt import PyJWKClient
+from jwt import PyJWK
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,11 +34,56 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # Supabase now signs user session JWTs with a rotating asymmetric key
 # pair rather than one static shared secret. We verify tokens against
-# Supabase's public JWKS endpoint instead of storing a secret — this
-# means key rotation on Supabase's side never breaks our backend, and
-# there's no secret to leak in the first place.
-SUPABASE_JWKS_URL = f"{SUPABASE_URL}/auth/v1/jwks" if SUPABASE_URL else ""
-_jwks_client = PyJWKClient(SUPABASE_JWKS_URL) if SUPABASE_JWKS_URL else None
+# Supabase's public JWKS endpoint instead of storing a secret.
+#
+# IMPORTANT: Supabase's JWKS endpoint, like all its /auth/v1/* routes,
+# requires an `apikey` header even though the keys it returns are
+# public — omitting it returns 401. We use our own small fetcher
+# (below) instead of PyJWT's built-in PyJWKClient so we can attach
+# that header, and we cache results briefly to avoid hitting Supabase
+# on every single request.
+SUPABASE_JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else ""
+
+_jwks_cache = {"keys": None, "fetched_at": 0}
+_JWKS_CACHE_TTL_SECONDS = 600  # refetch at most every 10 minutes
+
+
+def _fetch_jwks() -> dict:
+    """Fetches Supabase's public signing keys, with the required apikey
+    header, and caches the result briefly."""
+    now = time.time()
+    if _jwks_cache["keys"] and (now - _jwks_cache["fetched_at"] < _JWKS_CACHE_TTL_SECONDS):
+        return _jwks_cache["keys"]
+
+    if not SUPABASE_JWKS_URL or not SUPABASE_KEY:
+        raise Exception("Supabase URL/key not configured on server.")
+
+    res = httpx.get(
+        SUPABASE_JWKS_URL,
+        headers={"apikey": SUPABASE_KEY},
+        timeout=10,
+    )
+    if res.status_code != 200:
+        raise Exception(f"Could not fetch JWKS ({res.status_code}): {res.text[:200]}")
+
+    keys_data = res.json()
+    _jwks_cache["keys"] = keys_data
+    _jwks_cache["fetched_at"] = now
+    return keys_data
+
+
+def _get_signing_key_for_token(token: str) -> str:
+    """Finds the specific public key (by 'kid') that matches the given
+    JWT's header, from Supabase's JWKS."""
+    unverified_header = jwt.get_unverified_header(token)
+    kid = unverified_header.get("kid")
+
+    jwks = _fetch_jwks()
+    for key_dict in jwks.get("keys", []):
+        if key_dict.get("kid") == kid:
+            return PyJWK.from_dict(key_dict).key
+
+    raise Exception("No matching signing key found for this token.")
 
 # Free-tier daily request caps, as published by each provider.
 # Used to calculate "remaining" quota for the rate limit UI.
@@ -95,7 +141,7 @@ async def get_current_user(authorization: str | None = Header(default=None)) -> 
     header, verifies it was genuinely issued by Supabase for this
     project (via Supabase's public JWKS endpoint), and returns the
     user's id. Raises 401 if missing/invalid/expired."""
-    if not _jwks_client:
+    if not SUPABASE_JWKS_URL:
         raise HTTPException(status_code=503, detail="Auth not configured on server.")
 
     if not authorization or not authorization.startswith("Bearer "):
@@ -104,19 +150,19 @@ async def get_current_user(authorization: str | None = Header(default=None)) -> 
     token = authorization.removeprefix("Bearer ").strip()
 
     try:
-        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        signing_key = _get_signing_key_for_token(token)
         payload = jwt.decode(
             token,
-            signing_key.key,
+            signing_key,
             algorithms=["ES256", "RS256"],
             audience="authenticated",
         )
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
-    except jwt.PyJWKClientError as e:
-        raise HTTPException(status_code=401, detail=f"Could not verify token signature: {e}")
     except jwt.InvalidTokenError as e:
         raise HTTPException(status_code=401, detail=f"Invalid session token: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Could not verify token signature: {e}")
 
     user_id = payload.get("sub")
     if not user_id:
@@ -129,7 +175,7 @@ async def get_optional_user(authorization: str | None = Header(default=None)) ->
     """Like get_current_user, but returns None instead of raising when
     no token is present — for routes that work for both logged-in and
     anonymous/incognito use (e.g. /chat, /agent don't require login)."""
-    if not authorization or not authorization.startswith("Bearer ") or not _jwks_client:
+    if not authorization or not authorization.startswith("Bearer ") or not SUPABASE_JWKS_URL:
         return None
     try:
         return await get_current_user(authorization)
