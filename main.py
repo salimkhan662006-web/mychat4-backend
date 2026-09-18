@@ -462,10 +462,10 @@ async def classify_with_limbic_system(message: str) -> dict:
                     "Authorization": f"Bearer {GROQ_KEY}",
                 },
                 json={
-                    "model": "llama-3.1-8b-instant",
+                    "model": "openai/gpt-oss-20b",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.1,  # low temperature — this is classification, not creativity
-                    "max_tokens": 200,
+                    "max_tokens": 300,
                 },
             )
 
