@@ -9,6 +9,7 @@ so if one provider is rate-limited or down, the next one takes over.
 import os
 import io
 import time
+import json
 import secrets
 import httpx
 import PyPDF2
@@ -390,6 +391,150 @@ async def get_ai_response(history: list[dict], message: str, endpoint: str = "ch
         status_code=502,
         detail="All AI providers failed.\n" + "\n".join(errors),
     )
+
+
+# =================================================================
+# BRAIN ARCHITECTURE — Digital Limbic System (Phase 1)
+# =================================================================
+# The Limbic System is a fast triage layer, not a reasoner. It looks
+# at an incoming request and makes a rapid, cheap classification —
+# what kind of task this is, how complex it looks, and which
+# hemisphere should handle it — the same way a biological amygdala
+# flags salience before the prefrontal cortex ever gets involved.
+#
+# It deliberately uses the fastest, cheapest model available (Groq)
+# with a small, structured-output prompt. It should never take
+# meaningfully longer than a normal chat request, or it defeats its
+# own purpose.
+
+LIMBIC_CLASSIFIER_PROMPT = """You are a fast request classifier. Read the user's message and respond with ONLY a JSON object, no other text, no markdown fences.
+
+Classify it as:
+{
+  "task_type": one of "creative", "analytical", "factual", "mixed",
+  "complexity": a number from 0.0 (trivial) to 1.0 (very complex),
+  "recommended_hemisphere": one of "instinct", "logic", "both",
+  "confidence": a number from 0.0 to 1.0,
+  "reasoning": a very short (under 15 words) explanation
+}
+
+Guidance:
+- "creative": writing, brainstorming, open-ended generation, opinion, casual conversation
+- "analytical": reasoning, comparison, multi-step problems, code, structured analysis
+- "factual": simple factual lookups, definitions, straightforward Q&A
+- "mixed": genuinely needs both creative and analytical thinking together
+- complexity below 0.35 with high confidence -> recommend "instinct" (fast, single-pass)
+- complexity above 0.65, or task_type "analytical"/"mixed" -> recommend "logic" (deeper reasoning)
+- only recommend "both" for genuinely complex "mixed" requests where a single pathway would miss something
+- keep it fast: don't overthink, this is triage, not the actual answer
+
+User message: {message}"""
+
+
+async def classify_with_limbic_system(message: str) -> dict:
+    """Runs the fast triage classification. Falls back to a safe
+    default ('logic', mid-complexity) if the classifier itself fails
+    or returns malformed output — the system should degrade gracefully,
+    never block a real request because triage had a hiccup."""
+    start = time.time()
+
+    fallback = {
+        "task_type": "mixed",
+        "complexity": 0.5,
+        "recommended_hemisphere": "logic",
+        "confidence": 0.0,
+        "reasoning": "Classifier unavailable — defaulted to logic hemisphere for safety.",
+        "classification_provider": "fallback",
+        "classification_ms": 0,
+    }
+
+    if not GROQ_KEY:
+        return fallback
+
+    prompt = LIMBIC_CLASSIFIER_PROMPT.replace("{message}", message[:2000])  # cap input size
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            res = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {GROQ_KEY}",
+                },
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,  # low temperature — this is classification, not creativity
+                    "max_tokens": 200,
+                },
+            )
+
+        if res.status_code != 200:
+            raise Exception(f"Groq {res.status_code}: {res.text[:150]}")
+
+        data = res.json()
+        raw_text = data["choices"][0]["message"]["content"].strip()
+
+        # Strip markdown fences if the model added them despite instructions
+        if raw_text.startswith("```"):
+            raw_text = raw_text.strip("`").removeprefix("json").strip()
+
+        parsed = json.loads(raw_text)
+
+        # Validate shape — if anything's missing or malformed, fall back safely
+        task_type = parsed.get("task_type")
+        hemisphere = parsed.get("recommended_hemisphere")
+        complexity = float(parsed.get("complexity", 0.5))
+        confidence = float(parsed.get("confidence", 0.5))
+
+        if task_type not in ("creative", "analytical", "factual", "mixed"):
+            raise ValueError(f"Invalid task_type: {task_type}")
+        if hemisphere not in ("instinct", "logic", "both"):
+            raise ValueError(f"Invalid hemisphere: {hemisphere}")
+
+        elapsed_ms = int((time.time() - start) * 1000)
+
+        return {
+            "task_type": task_type,
+            "complexity": round(max(0.0, min(1.0, complexity)), 2),
+            "recommended_hemisphere": hemisphere,
+            "confidence": round(max(0.0, min(1.0, confidence)), 2),
+            "reasoning": str(parsed.get("reasoning", ""))[:200],
+            "classification_provider": "groq",
+            "classification_ms": elapsed_ms,
+        }
+
+    except Exception as e:
+        print(f"Limbic classification failed, using fallback: {e}")
+        fallback["classification_ms"] = int((time.time() - start) * 1000)
+        return fallback
+
+
+def log_limbic_decision(
+    decision: dict,
+    input_preview: str,
+    user_id: str | None = None,
+    conversation_id: str | None = None,
+):
+    """Fire-and-forget log of a classification decision. Never blocks
+    or breaks the main request if Supabase is unreachable."""
+    if not supabase:
+        return
+    try:
+        supabase.table("limbic_decisions").insert({
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "input_preview": input_preview[:200],
+            "task_type": decision["task_type"],
+            "complexity": decision["complexity"],
+            "recommended_hemisphere": decision["recommended_hemisphere"],
+            "confidence": decision["confidence"],
+            "reasoning": decision["reasoning"],
+            "classification_provider": decision["classification_provider"],
+            "classification_ms": decision["classification_ms"],
+        }).execute()
+    except Exception as e:
+        print(f"Limbic decision logging failed (non-fatal): {e}")
 
 
 # ---------------------------------------------------------------
@@ -991,3 +1136,33 @@ async def confirm_account_deletion(req: ConfirmDeletionRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not complete account deletion: {e}")
+
+
+# ---------------------------------------------------------------
+# Brain Architecture — Phase 1 testable endpoint
+# ---------------------------------------------------------------
+class LimbicClassifyRequest(BaseModel):
+    message: str
+    conversation_id: str | None = None
+
+
+@app.post("/brain/classify")
+async def classify_request(req: LimbicClassifyRequest, user_id: str | None = Depends(get_optional_user)):
+    """Runs the Digital Limbic System on a message and returns its
+    triage decision. This is Phase 1 in isolation — nothing is actually
+    routed to a hemisphere yet, this just classifies and logs, so the
+    classifier itself can be tested and tuned before Phase 2 wires it
+    into real request handling."""
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="No message provided.")
+
+    decision = await classify_with_limbic_system(req.message)
+
+    log_limbic_decision(
+        decision,
+        input_preview=req.message,
+        user_id=user_id,
+        conversation_id=req.conversation_id,
+    )
+
+    return decision
