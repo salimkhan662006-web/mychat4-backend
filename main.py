@@ -17,10 +17,18 @@ import jwt
 from jwt import PyJWK
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 load_dotenv()
 
@@ -1166,3 +1174,233 @@ async def classify_request(req: LimbicClassifyRequest, user_id: str | None = Dep
     )
 
     return decision
+
+
+# =================================================================
+# Document generation — Excel & PowerPoint
+# =================================================================
+# Two-step process: (1) ask the AI to plan the content as strict JSON,
+# (2) convert that JSON into a real file with python-pptx / openpyxl.
+# The same JSON also powers the chat preview, so what the user sees
+# in-chat always matches exactly what's in the downloaded file.
+
+PPTX_PLAN_PROMPT = """You are a presentation planning assistant. Based on the user's request, create a slide-by-slide plan. Respond with ONLY a JSON object, no other text, no markdown fences.
+
+Format:
+{
+  "title": "Presentation title",
+  "slides": [
+    {
+      "heading": "Slide heading",
+      "bullets": ["point one", "point two", "point three"]
+    }
+  ]
+}
+
+Guidance:
+- 5 to 10 slides depending on the topic's depth
+- Each slide: 3 to 5 concise bullets, not full paragraphs
+- First slide should be a title/overview slide with no bullets, or 1-2 framing bullets
+- Keep bullets under 15 words each
+
+User request: {request}"""
+
+XLSX_PLAN_PROMPT = """You are a spreadsheet planning assistant. Based on the user's request, create structured tabular data. Respond with ONLY a JSON object, no other text, no markdown fences.
+
+Format:
+{
+  "title": "Spreadsheet title",
+  "sheet_name": "Sheet1",
+  "headers": ["Column A", "Column B", "Column C"],
+  "rows": [
+    ["value1", "value2", "value3"],
+    ["value1", "value2", "value3"]
+  ]
+}
+
+Guidance:
+- Infer sensible column headers from the request
+- Include realistic, useful sample rows if the user didn't supply exact data
+- Keep it focused: one clear table, not multiple unrelated tables
+- Numbers should be actual numbers in the JSON (not quoted strings) where appropriate
+
+User request: {request}"""
+
+
+async def plan_document_content(request_text: str, doc_type: str) -> dict:
+    """Asks the AI to plan the content as strict JSON. Uses the same
+    Groq->Gemini->OpenRouter fallback as everything else, but expects
+    and validates structured output specifically."""
+    prompt_template = PPTX_PLAN_PROMPT if doc_type == "pptx" else XLSX_PLAN_PROMPT
+    prompt = prompt_template.replace("{request}", request_text[:2000])
+
+    result = await get_ai_response(history=[], message=prompt, endpoint="document_gen")
+    raw_text = result["reply"].strip()
+
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`").removeprefix("json").strip()
+
+    try:
+        plan = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"The AI's response wasn't valid structured content, please try again. ({e})",
+        )
+
+    return {"plan": plan, "provider": result["provider"]}
+
+
+def build_pptx_file(plan: dict) -> io.BytesIO:
+    """Builds a real .pptx file from a content plan, styled to loosely
+    match the app's dark red aesthetic."""
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+
+    DARK_BG = RGBColor(0x0A, 0x05, 0x05)
+    ACCENT_RED = RGBColor(0xFF, 0x2E, 0x2E)
+    TEXT_LIGHT = RGBColor(0xF2, 0xE8, 0xE5)
+    TEXT_MUTED = RGBColor(0xC9, 0x93, 0x8D)
+
+    blank_layout = prs.slide_layouts[6]
+
+    # Title slide
+    slide = prs.slides.add_slide(blank_layout)
+    bg = slide.background
+    bg.fill.solid()
+    bg.fill.fore_color.rgb = DARK_BG
+
+    title_box = slide.shapes.add_textbox(Inches(1), Inches(3), Inches(11.3), Inches(1.5))
+    tf = title_box.text_frame
+    tf.text = plan.get("title", "Untitled Presentation")
+    tf.paragraphs[0].font.size = Pt(44)
+    tf.paragraphs[0].font.bold = True
+    tf.paragraphs[0].font.color.rgb = TEXT_LIGHT
+    tf.paragraphs[0].alignment = PP_ALIGN.CENTER
+
+    accent_line = slide.shapes.add_shape(1, Inches(5.5), Inches(4.6), Inches(2.3), Pt(3))
+    accent_line.fill.solid()
+    accent_line.fill.fore_color.rgb = ACCENT_RED
+    accent_line.line.fill.background()
+
+    # Content slides
+    for slide_data in plan.get("slides", []):
+        slide = prs.slides.add_slide(blank_layout)
+        bg = slide.background
+        bg.fill.solid()
+        bg.fill.fore_color.rgb = DARK_BG
+
+        heading_box = slide.shapes.add_textbox(Inches(0.7), Inches(0.5), Inches(11.9), Inches(1))
+        htf = heading_box.text_frame
+        htf.text = slide_data.get("heading", "")
+        htf.paragraphs[0].font.size = Pt(30)
+        htf.paragraphs[0].font.bold = True
+        htf.paragraphs[0].font.color.rgb = ACCENT_RED
+
+        bullets = slide_data.get("bullets", [])
+        if bullets:
+            body_box = slide.shapes.add_textbox(Inches(1), Inches(1.8), Inches(11.3), Inches(5))
+            btf = body_box.text_frame
+            btf.word_wrap = True
+            for i, bullet in enumerate(bullets):
+                p = btf.paragraphs[0] if i == 0 else btf.add_paragraph()
+                p.text = f"•  {bullet}"
+                p.font.size = Pt(20)
+                p.font.color.rgb = TEXT_LIGHT
+                p.space_after = Pt(16)
+
+    buffer = io.BytesIO()
+    prs.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def build_xlsx_file(plan: dict) -> io.BytesIO:
+    """Builds a real .xlsx file from a content plan, with basic styling."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = plan.get("sheet_name", "Sheet1")[:31]  # Excel sheet name limit
+
+    headers = plan.get("headers", [])
+    rows = plan.get("rows", [])
+
+    HEADER_FILL = PatternFill(start_color="8B1A1A", end_color="8B1A1A", fill_type="solid")
+    HEADER_FONT = Font(color="FFFFFF", bold=True, size=12)
+
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, row_data in enumerate(rows, start=2):
+        for col_idx, value in enumerate(row_data, start=1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    # Auto-fit column widths, roughly
+    for col_idx, header in enumerate(headers, start=1):
+        max_len = len(str(header))
+        for row_data in rows:
+            if col_idx - 1 < len(row_data):
+                max_len = max(max_len, len(str(row_data[col_idx - 1])))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 40)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+class DocumentGenRequest(BaseModel):
+    request: str
+    doc_type: str  # "pptx" or "xlsx"
+
+
+@app.post("/generate/plan")
+async def generate_document_plan(req: DocumentGenRequest, user_id: str | None = Depends(get_optional_user)):
+    """Step 1: plans the content as structured JSON, returned for the
+    chat preview. Does not create the actual file yet — that happens
+    in /generate/file, using this same plan, once the user confirms
+    they want to download it."""
+    if req.doc_type not in ("pptx", "xlsx"):
+        raise HTTPException(status_code=400, detail="doc_type must be 'pptx' or 'xlsx'.")
+    if not req.request.strip():
+        raise HTTPException(status_code=400, detail="No request provided.")
+
+    result = await plan_document_content(req.request, req.doc_type)
+    return result  # { plan, provider }
+
+
+class DocumentFileRequest(BaseModel):
+    plan: dict
+    doc_type: str
+
+
+@app.post("/generate/file")
+async def generate_document_file(req: DocumentFileRequest):
+    """Step 2: converts an already-planned JSON structure into a real
+    downloadable file. Takes the plan directly (not a request string)
+    so the file always matches exactly what the user saw previewed."""
+    if req.doc_type not in ("pptx", "xlsx"):
+        raise HTTPException(status_code=400, detail="doc_type must be 'pptx' or 'xlsx'.")
+
+    try:
+        if req.doc_type == "pptx":
+            buffer = build_pptx_file(req.plan)
+            media_type = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            filename = f"{req.plan.get('title', 'presentation')[:40]}.pptx"
+        else:
+            buffer = build_xlsx_file(req.plan)
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            filename = f"{req.plan.get('title', 'spreadsheet')[:40]}.xlsx"
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not build file: {e}")
+
+    safe_filename = "".join(c for c in filename if c.isalnum() or c in " ._-")
+
+    return StreamingResponse(
+        buffer,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
+    )
