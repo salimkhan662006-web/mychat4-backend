@@ -1223,6 +1223,16 @@ Guidance:
 - Include realistic, useful sample rows if the user didn't supply exact data
 - Keep it focused: one clear table, not multiple unrelated tables
 - Numbers should be actual numbers in the JSON (not quoted strings) where appropriate
+- READ THE REQUEST CAREFULLY for anything asking for totals, sums, averages,
+  running totals, grand totals, or an overall/final result. If the request
+  asks for these (explicitly or implicitly, e.g. "total X across Y"), you
+  MUST include them as extra row(s) at the end of the table — for example
+  a final row labeled "Total" or "Grand Total" with the actual summed
+  value(s) computed correctly across all preceding rows. Do not omit
+  requested totals/summaries even if the row-by-row data is the bulk of
+  the answer — both the detail rows AND the summary the user asked for
+  must be present.
+- Double check your arithmetic — a wrong total is worse than no total.
 
 User request: {request}"""
 
@@ -1334,9 +1344,23 @@ def build_xlsx_file(plan: dict) -> io.BytesIO:
         cell.font = HEADER_FONT
         cell.alignment = Alignment(horizontal="center")
 
+    TOTAL_FILL = PatternFill(start_color="2A1414", end_color="2A1414", fill_type="solid")
+    TOTAL_FONT = Font(bold=True, color="FF6B6B")
+
     for row_idx, row_data in enumerate(rows, start=2):
+        # Detect summary/total rows by their first cell's label, so they
+        # stand out visually from the detail rows above them.
+        first_cell_text = str(row_data[0]).lower() if row_data else ""
+        is_total_row = any(
+            keyword in first_cell_text
+            for keyword in ("total", "sum", "grand total", "average", "overall")
+        )
+
         for col_idx, value in enumerate(row_data, start=1):
-            ws.cell(row=row_idx, column=col_idx, value=value)
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            if is_total_row:
+                cell.fill = TOTAL_FILL
+                cell.font = TOTAL_FONT
 
     # Auto-fit column widths, roughly
     for col_idx, header in enumerate(headers, start=1):
