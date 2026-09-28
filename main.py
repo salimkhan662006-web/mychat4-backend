@@ -38,6 +38,7 @@ load_dotenv()
 GROQ_KEY = os.environ.get("GROQ_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
+TAVILY_KEY = os.environ.get("TAVILY_KEY", "")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -1428,3 +1429,100 @@ async def generate_document_file(req: DocumentFileRequest):
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
     )
+
+
+# =================================================================
+# Web search / research capability
+# =================================================================
+# Two-step, same shape as document generation: (1) fetch real search
+# results from Tavily, (2) have the AI synthesize a grounded, cited
+# answer from those results — never letting the model just improvise
+# an answer about current events with no real sources behind it.
+
+async def run_tavily_search(query: str, max_results: int = 5) -> list[dict]:
+    """Fetches real web search results from Tavily. Raises on failure
+    so the caller can decide how to handle it — never silently returns
+    an empty list, which would let the AI hallucinate unmarked."""
+    if not TAVILY_KEY:
+        raise Exception("TAVILY_KEY not configured on server.")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        res = await client.post(
+            "https://api.tavily.com/search",
+            headers={"Content-Type": "application/json"},
+            json={
+                "api_key": TAVILY_KEY,
+                "query": query,
+                "max_results": max_results,
+                "include_answer": False,  # we synthesize our own answer, for consistent citation style
+            },
+        )
+
+    if res.status_code != 200:
+        raise Exception(f"Tavily {res.status_code}: {res.text[:200]}")
+
+    data = res.json()
+    results = data.get("results", [])
+
+    return [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("content", "")[:500],
+        }
+        for r in results
+    ]
+
+
+SEARCH_SYNTHESIS_PROMPT = """You are answering a question using real, current web search results provided below. Write a clear, direct answer grounded ONLY in these results.
+
+Rules:
+- Cite sources inline using [1], [2], etc. matching the numbered results below
+- If the results don't actually answer the question, say so honestly rather than guessing
+- Be concise — a few sentences to a short paragraph, not an essay
+- Do not invent facts not present in the results
+
+Search results:
+{results}
+
+Question: {question}"""
+
+
+class SearchRequest(BaseModel):
+    query: str
+    conversation_id: str | None = None
+
+
+@app.post("/search")
+async def web_search(req: SearchRequest, user_id: str | None = Depends(get_optional_user)):
+    """Runs a real web search and returns a synthesized, cited answer
+    plus the source list, so the frontend can show clickable links
+    alongside the AI's answer."""
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="No search query provided.")
+
+    try:
+        results = await run_tavily_search(req.query)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Search failed: {e}")
+
+    if not results:
+        return {
+            "answer": "I couldn't find any current results for that search — try rephrasing it.",
+            "sources": [],
+            "provider": None,
+        }
+
+    results_block = "\n\n".join(
+        f"[{i+1}] {r['title']}\n{r['url']}\n{r['snippet']}"
+        for i, r in enumerate(results)
+    )
+    prompt = SEARCH_SYNTHESIS_PROMPT.replace("{results}", results_block).replace("{question}", req.query)
+
+    ai_result = await get_ai_response(history=[], message=prompt, endpoint="search", user_id=user_id)
+
+    return {
+        "answer": ai_result["reply"],
+        "sources": results,
+        "provider": ai_result["provider"],
+    }
