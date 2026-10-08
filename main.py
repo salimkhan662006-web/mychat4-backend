@@ -8,6 +8,7 @@ so if one provider is rate-limited or down, the next one takes over.
 
 import os
 import io
+import re
 import time
 import json
 import secrets
@@ -554,11 +555,81 @@ async def health_check():
     return {"status": "ok", "message": "MyChat4 backend is running"}
 
 
+STRUCTURED_RESPONSE_SUFFIX = """
+
+---
+Before answering, consider whether this content is naturally structured as
+a comparison, a branching breakdown (a main point with sub-points), a
+process/sequence, a relationship between things, or numeric data worth
+charting. Most questions are NOT like this — plain conversational text is
+usually correct and preferred.
+
+Only if the content genuinely fits, end your response with a separate
+final line containing ONLY a JSON object (no other text on that line),
+in one of these exact shapes:
+
+For a tree/branching breakdown:
+{"format": "tree", "root": "main point", "branches": [{"label": "sub-point", "children": ["detail", "detail"]}]}
+
+For a chart (numeric comparison):
+{"format": "chart", "chart_type": "bar", "title": "chart title", "data": [{"label": "A", "value": 10}, {"label": "B", "value": 20}]}
+
+If plain text is the right format (the common case), do NOT include any JSON line at all — just answer normally."""
+
+
+def extract_structured_block(reply: str) -> dict:
+    """Looks for a trailing JSON line in the AI's reply indicating it
+    chose a structured format (tree or chart). Returns the plain text
+    (with the JSON line stripped out) plus the parsed structure, or
+    None for structure if the AI just answered normally — which is
+    the common, expected case."""
+    lines = reply.rstrip().split("\n")
+    if not lines:
+        return {"text": reply, "structure": None}
+
+    last_line = lines[-1].strip()
+    if not (last_line.startswith("{") and last_line.endswith("}")):
+        return {"text": reply, "structure": None}
+
+    try:
+        parsed = json.loads(last_line)
+    except json.JSONDecodeError:
+        return {"text": reply, "structure": None}
+
+    fmt = parsed.get("format")
+    if fmt not in ("tree", "chart"):
+        return {"text": reply, "structure": None}
+
+    # Basic shape validation — if it's malformed, fall back to plain
+    # text rather than risk rendering something broken in the UI.
+    try:
+        if fmt == "tree":
+            assert isinstance(parsed.get("root"), str)
+            assert isinstance(parsed.get("branches"), list)
+        elif fmt == "chart":
+            assert isinstance(parsed.get("data"), list)
+            assert all("label" in d and "value" in d for d in parsed["data"])
+    except (AssertionError, KeyError, TypeError):
+        return {"text": reply, "structure": None}
+
+    text_without_json = "\n".join(lines[:-1]).rstrip()
+    return {"text": text_without_json, "structure": parsed}
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest, user_id: str | None = Depends(get_optional_user)):
     history = [m.model_dump() for m in req.history]
-    result = await get_ai_response(history, req.message, endpoint="chat", user_id=user_id)
-    return result
+    message_with_instruction = req.message + STRUCTURED_RESPONSE_SUFFIX
+
+    result = await get_ai_response(history, message_with_instruction, endpoint="chat", user_id=user_id)
+
+    extracted = extract_structured_block(result["reply"])
+
+    return {
+        "reply": extracted["text"],
+        "structure": extracted["structure"],
+        "provider": result["provider"],
+    }
 
 
 @app.post("/upload")
@@ -1477,7 +1548,8 @@ async def run_tavily_search(query: str, max_results: int = 5) -> list[dict]:
 SEARCH_SYNTHESIS_PROMPT = """You are answering a question using real, current web search results provided below. Write a clear, direct answer grounded ONLY in these results.
 
 Rules:
-- Cite sources inline using [1], [2], etc. matching the numbered results below
+- Cite sources inline using ONLY plain square brackets with a single number, like [1] or [2], matching the numbered results below
+- NEVER use any other citation format — no special characters, no ranges, no line references, no brackets other than a single [n]
 - If the results don't actually answer the question, say so honestly rather than guessing
 - Be concise — a few sentences to a short paragraph, not an essay
 - Do not invent facts not present in the results
@@ -1486,6 +1558,18 @@ Search results:
 {results}
 
 Question: {question}"""
+
+
+def clean_citation_markers(text: str) -> str:
+    """Safety net: strips any non-standard citation syntax (like
+    Gemini's native 【n†Lx-Ly】 grounding format) that might slip
+    through despite the prompt instruction, normalizing everything to
+    plain [n] markers the frontend can reliably parse and link."""
+    # Convert 【1†L1-L4】 or similar bracket-star formats to [1]
+    text = re.sub(r"【(\d+)[^\d】]*】", r"[\1]", text)
+    # Catch any other stray full-width brackets as a fallback
+    text = text.replace("【", "[").replace("】", "]")
+    return text
 
 
 class SearchRequest(BaseModel):
@@ -1522,7 +1606,7 @@ async def web_search(req: SearchRequest, user_id: str | None = Depends(get_optio
     ai_result = await get_ai_response(history=[], message=prompt, endpoint="search", user_id=user_id)
 
     return {
-        "answer": ai_result["reply"],
+        "answer": clean_citation_markers(ai_result["reply"]),
         "sources": results,
         "provider": ai_result["provider"],
     }
