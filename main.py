@@ -425,6 +425,9 @@ class MessageCreate(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
     content: str = Field(max_length=100000)
     is_pinned_ref: bool = False
+    # Rich-message data (tree/chart, search sources, generated-file plan) so
+    # it survives reloading a chat. Cleaned by sanitize_meta() before saving.
+    meta: dict | None = None
 
 
 class BoxCreateRequest(BaseModel):
@@ -740,7 +743,12 @@ For a tree/branching breakdown:
 For a chart (numeric comparison):
 {"format": "chart", "chart_type": "bar", "title": "chart title", "data": [{"label": "A", "value": 10}, {"label": "B", "value": 20}]}
 
-If plain text is the right format (the common case), do NOT include any JSON line at all — just answer normally."""
+If plain text is the right format (the common case), do NOT include any JSON line at all — just answer normally.
+
+Rules for how you write:
+- When you DO attach a JSON structure, keep the written part of your answer to a short introduction (2-3 sentences at most). Do NOT repeat the structure's content as a list, table, ASCII drawing or code block — the app draws it as a visual for the reader.
+- Never put the JSON line inside a code fence.
+- This chat shows text exactly as written, so do not use markdown symbols such as ** or ### or ASCII boxes/tables. Use plain sentences and simple "-" lists."""
 
 
 # Matches a JSON object the model wrapped in a ```json ... ``` fence at the very end.
@@ -1132,6 +1140,59 @@ def delete_conversation(conversation_id: str, user_id: str = Depends(get_current
         server_error("Could not delete conversation.", e)
 
 
+MAX_META_BYTES = 200_000
+
+
+def sanitize_meta(meta: dict | None) -> dict | None:
+    """Rebuilds a clean copy of a message's rich data from untrusted input.
+    Only three shapes are allowed (plain text + optional tree/chart, search
+    results, generated-file preview); everything is size-limited and shape-
+    checked, and links must be real http(s) URLs, so what we store is always
+    safe to draw in the browser later."""
+    if meta is None:
+        return None
+    if not isinstance(meta, dict):
+        raise HTTPException(status_code=400, detail="Invalid message data.")
+
+    kind = meta.get("type", "text")
+    clean: dict = {"type": kind}
+
+    provider = meta.get("provider")
+    if isinstance(provider, str):
+        clean["provider"] = provider[:40]
+
+    if kind == "text":
+        structure = meta.get("structure")
+        if isinstance(structure, dict) and _valid_structure(structure):
+            clean["structure"] = structure
+    elif kind == "search-card":
+        sources = []
+        for s in _as_list(meta.get("sources"))[:10]:
+            if not isinstance(s, dict):
+                continue
+            url = str(s.get("url", ""))
+            if not url.lower().startswith(("http://", "https://")):
+                continue
+            sources.append({
+                "title": str(s.get("title", ""))[:200],
+                "url": url[:2000],
+                "snippet": str(s.get("snippet", ""))[:500],
+            })
+        clean["sources"] = sources
+    elif kind == "doc-gen-card":
+        doc_type = meta.get("docType")
+        if doc_type not in ("pptx", "xlsx"):
+            raise HTTPException(status_code=400, detail="Invalid message data.")
+        clean["docType"] = doc_type
+        clean["plan"] = sanitize_plan(meta.get("plan"), doc_type)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid message data.")
+
+    if len(json.dumps(clean)) > MAX_META_BYTES:
+        raise HTTPException(status_code=413, detail="Message data is too large.")
+    return clean
+
+
 @app.post("/messages")
 def save_message(req: MessageCreate, user_id: str = Depends(get_current_user)):
     """Saves a single message to a conversation. Called by the frontend
@@ -1143,12 +1204,26 @@ def save_message(req: MessageCreate, user_id: str = Depends(get_current_user)):
         # Verify the conversation belongs to this user before writing to it
         assert_owns_conversation(req.conversation_id, user_id)
 
-        res = supabase.table("messages").insert({
+        row = {
             "conversation_id": req.conversation_id,
             "role": req.role,
             "content": req.content,
             "is_pinned_ref": req.is_pinned_ref,
-        }).execute()
+        }
+        clean_meta = sanitize_meta(req.meta)
+        if clean_meta is not None:
+            row["meta"] = clean_meta
+
+        try:
+            res = supabase.table("messages").insert(row).execute()
+        except Exception as insert_err:
+            if "meta" not in row:
+                raise
+            # Safety net: if the database doesn't have the `meta` column yet
+            # (SQL step 3 not run), still save the message text.
+            logger.warning("Saving message with meta failed, retrying without it: %s", insert_err)
+            row.pop("meta")
+            res = supabase.table("messages").insert(row).execute()
 
         # Bump the conversation's updated_at so it sorts to the top of history
         supabase.table("conversations").update(
