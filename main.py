@@ -329,28 +329,33 @@ def check_rate_window(key: str, limit: int, window_seconds: int) -> bool:
     return True
 
 
-def _count_user_requests_today(user_id: str) -> int:
+def _bump_daily_usage(user_id: str, day: str) -> int | None:
+    """Atomically adds 1 to this user's counter for `day` and returns the
+    new total. The counter lives in its own table (daily_request_counts),
+    separate from chat data, so "Reset data" cannot wipe it and a server
+    restart cannot lose it. Returns None if the database is unreachable."""
     if not supabase:
-        return 0
+        return None
     try:
-        res = (
-            supabase.table("usage_logs")
-            .select("provider", count="exact")
-            .eq("user_id", user_id)
-            .gte("created_at", utc_start_of_day())
-            .limit(1)
-            .execute()
-        )
-        return res.count or 0
+        res = supabase.rpc("increment_daily_usage", {"p_user": user_id, "p_day": day}).execute()
+        value = res.data
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if isinstance(value, dict):
+            value = next(iter(value.values()), None)
+        return int(value) if value is not None else None
     except Exception as e:
-        # Fail open: a hiccup in the counter must not lock real users out.
-        logger.warning("Daily count lookup failed (non-fatal): %s", e)
-        return 0
+        logger.warning("Daily counter unavailable, using in-memory fallback: %s", e)
+        return None
 
 
 async def ai_guard(user_id: str = Depends(get_current_user)) -> str:
     """Dependency for routes that spend AI quota: requires login, then
-    enforces a per-minute and a per-day cap for this user."""
+    enforces a per-minute and a per-day cap for this user.
+
+    Per-minute: in memory (resets if Render restarts — harmless, it only
+    smooths bursts). Per-day: stored in the database, so it survives
+    restarts AND "Reset data"."""
     if not check_rate_window(f"ai-min:{user_id}", USER_REQUESTS_PER_MINUTE, 60):
         raise HTTPException(
             status_code=429,
@@ -358,18 +363,22 @@ async def ai_guard(user_id: str = Depends(get_current_user)) -> str:
         )
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if len(_daily_memory) > 2000:
-        for k in [k for k in _daily_memory if k[1] != today]:
-            del _daily_memory[k]
+    used = await run_in_threadpool(_bump_daily_usage, user_id, today)
 
-    db_count = await run_in_threadpool(_count_user_requests_today, user_id)
-    used = max(db_count, _daily_memory.get((user_id, today), 0))
-    if used >= USER_REQUESTS_PER_DAY:
+    if used is None:
+        # Database counter unavailable: fall back to a per-process count so
+        # the cap still applies (fail-safe, not fail-open).
+        if len(_daily_memory) > 2000:
+            for k in [k for k in _daily_memory if k[1] != today]:
+                del _daily_memory[k]
+        used = _daily_memory.get((user_id, today), 0) + 1
+        _daily_memory[(user_id, today)] = used
+
+    if used > USER_REQUESTS_PER_DAY:
         raise HTTPException(
             status_code=429,
             detail="You've reached today's free request limit. It resets at midnight UTC.",
         )
-    _daily_memory[(user_id, today)] = used + 1
     return user_id
 
 
@@ -1445,6 +1454,13 @@ def confirm_account_deletion(req: ConfirmDeletionRequest):
 
         # 1) Delete all owned data.
         wipe_user_data(user_id)
+
+        # 1b) Remove the per-day request counter. ("Reset data" keeps it on
+        #     purpose so limits can't be dodged; deleting the account removes it.)
+        try:
+            supabase.table("daily_request_counts").delete().eq("user_id", user_id).execute()
+        except Exception as counter_err:
+            logger.warning("Could not clear daily counter rows: %s", counter_err)
 
         # 2) Delete the actual auth account (admin API, service-role client).
         #    The token is deliberately NOT burned before this step: if the
